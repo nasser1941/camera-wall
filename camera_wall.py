@@ -2,19 +2,21 @@
 """
 Dahua Camera Wall — Multi-camera live viewer for Dahua IP cameras.
 
-Reads camera list and grid layout from a JSON config file at startup.
-The window fills the screen; each camera cell scales to fill its cell.
+Shows cameras in a 2×3 grid (configurable) with auto-reconnect on stream failure.
+Plays direct RTSP streams (no NVR token needed).
+Uses OpenCV (FFmpeg) for RTSP — works even when system VLC lacks live555.
 
-Config file: ~/.camera_wall/config.json
+Configuration is read from ~/.camera_wall/config.json at startup.
 """
 
 import sys
+import os
 import json
 import time
 import logging
 from pathlib import Path
 from typing import Any, Dict
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRect
 from PyQt6.QtGui import QFont, QColor, QPixmap, QImage
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout,
@@ -53,19 +55,21 @@ GRID_LAYOUTS = {
     "1+6":  {"rows": 3, "cols": 4, "layout": "1big_6small"},
 }
 
-# ASCII-only keys — config file should use these
-_GRID_LAYOUT_KEYS = set(GRID_LAYOUTS.keys())
+# Normalized lookup: maps ASCII 'x' versions to Unicode keys
+_GRID_LAYOUT_NORMALIZATION = {
+    k.replace("×", "x"): k for k in GRID_LAYOUTS.keys()
+}
 
 
 def _normalize_layout_name(name: str) -> str:
-    """Normalize a layout name: convert Unicode × to ASCII x for lookup."""
+    """Normalize a layout name for dictionary lookup."""
+    # First try direct lookup
+    if name in GRID_LAYOUTS:
+        return name
+    # Try normalizing (convert × to x for lookup)
     normalized = name.replace("×", "x")
-    if normalized in _GRID_LAYOUT_KEYS:
-        return normalized
-    # Try to find a matching key by normalizing the dict keys too
-    for key in _GRID_LAYOUT_KEYS:
-        if key.replace("×", "x") == normalized:
-            return key
+    if normalized in _GRID_LAYOUT_NORMALIZATION:
+        return _GRID_LAYOUT_NORMALIZATION[normalized]
     return name
 
 
@@ -99,17 +103,17 @@ def load_config() -> Dict[str, Any]:
     return DEFAULT_CONFIG.copy()
 
 
-# ── RTSP URL builder ───────────────────────────────────────────────────
+# ── RTSP URL helpers ──────────────────────────────────────────────────
 def build_rtsp_url(camera_ip: str, username: str, password: str, channel: int = 1, subtype: int = 0) -> str:
     """
-    Build Dahua RTSP URL.
+    Build Dahua RTSP URL for the main stream.
 
     Parameters:
         camera_ip: IP address of the camera
         username: Camera username
         password: Camera password
         channel: Camera channel number (1-based)
-        subtype: 0 = main stream, 1 = sub stream
+        subtype: 0 = main stream (high quality), 1 = sub stream
 
     Returns:
         Full RTSP URL string
@@ -145,6 +149,7 @@ class FrameReader(QThread):
 
     def stop(self):
         self._running = False
+        self.wait(3000)
 
     def _set_status(self, status: str):
         self.status_changed.emit(self.camera_name, status)
@@ -158,6 +163,7 @@ class FrameReader(QThread):
             self._cap.release()
         self._cap = cv2.VideoCapture(self.rtsp_url)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Wait for connection
         for _ in range(30):  # 3s max wait
             if not self._running:
                 return False
@@ -168,16 +174,17 @@ class FrameReader(QThread):
 
     def run(self):
         """Main loop: keep reading frames, reconnect on failure."""
-        log.info("%s: starting -> %s", self.camera_name, self.rtsp_url)
-        self._set_status("Connecting...")
+        log.info("%s: starting → %s", self.camera_name, self.rtsp_url)
+        self._set_status("Connecting…")
         self._set_color(QColor(128, 128, 128))  # grey
         self._connect_start = time.time()
 
         while self._running:
+            # Open camera
             if not self._open_camera():
                 if not self._running:
                     return
-                self._set_status("Reconnecting...")
+                self._set_status("Reconnecting…")
                 self._set_color(QColor(255, 165, 0))
                 time.sleep(3)
                 continue
@@ -186,21 +193,25 @@ class FrameReader(QThread):
             self._set_color(QColor(50, 205, 50))  # green
             self._error_start = None
 
+            # Read frames
             while self._running:
                 ret, frame = self._cap.read()
                 if not ret or frame is None:
                     break
 
+                # Convert BGR → RGB → QImage
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb.shape
                 bytes_per_line = ch * w
                 qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                # Copy the image data — Qt only holds a reference during the signal
                 self.frame_ready.emit(qimg.copy())
 
+            # Stream ended or error — reconnect
             elapsed = time.time() - self._connect_start if self._connect_start else 0
             if elapsed < 15:
                 log.info("%s: stream ended, reconnecting", self.camera_name)
-                self._set_status("Reconnecting...")
+                self._set_status("Reconnecting…")
                 self._set_color(QColor(255, 165, 0))
             else:
                 log.warning("%s: stream error after timeout", self.camera_name)
@@ -217,7 +228,7 @@ class FrameReader(QThread):
 
 
 # ── Camera panel widget ───────────────────────────────────────────────
-class CameraPanel(QFrame):
+class VLCPanel(QFrame):
     """A single camera panel with video display and status label."""
 
     def __init__(self, camera_name: str, rtsp_url: str, parent=None):
@@ -232,9 +243,10 @@ class CameraPanel(QFrame):
         self.video_label.setStyleSheet(
             "QLabel { background-color: #000; color: #fff; }"
         )
+        self.video_label.setMinimumSize(200, 150)
 
         # Status label
-        self.status_label = QLabel("Connecting...")
+        self.status_label = QLabel("Connecting…")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setFont(QFont("Monospace", 9))
 
@@ -256,6 +268,7 @@ class CameraPanel(QFrame):
     def _on_frame(self, qimg: QImage):
         """Update the video display with a new frame."""
         pixmap = QPixmap.fromImage(qimg)
+        # Scale to fit the label while preserving aspect ratio
         self.video_label.setPixmap(
             pixmap.scaled(
                 self.video_label.size(),
@@ -283,18 +296,20 @@ class CameraPanel(QFrame):
 
 # ── Main window ───────────────────────────────────────────────────────
 class CameraWall(QMainWindow):
-    """Main application window with camera grid."""
+    """Main application window with a configurable camera grid."""
 
     def __init__(self):
         super().__init__()
         self.config = load_config()
-        self.panels = []
+        self.panels: list[VLCPanel] = []
         self.setWindowTitle("Dahua Camera Wall")
+        self.setMinimumSize(1280, 720)
+        self.resize(1600, 900)
 
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self._overall_label = QLabel("Initializing...")
+        self._overall_label = QLabel("Initializing…")
         self._overall_label.setFont(QFont("Monospace", 10))
         self.status_bar.addPermanentWidget(self._overall_label)
 
@@ -308,10 +323,8 @@ class CameraWall(QMainWindow):
         # Build grid from config
         self._build_grid()
 
-        # Start all streams and size panels after the window is shown
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(100, self._start_all)
-        QTimer.singleShot(200, self._size_panels)
+        # Start all streams
+        QTimer.singleShot(1000, self._start_all)
 
     def _build_grid(self):
         """Build the camera grid based on current configuration."""
@@ -331,11 +344,8 @@ class CameraWall(QMainWindow):
                 col = idx % cols
                 cam = self.config["cameras"][idx]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
-                rtsp_url = build_rtsp_url(
-                    cam["ip"], cam.get("username", "admin"),
-                    cam.get("password", ""), channel=1, subtype=stream_subtype
-                )
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, row, col)
                 self.panels.append(panel)
 
@@ -347,38 +357,6 @@ class CameraWall(QMainWindow):
 
         self._update_overall_status()
 
-    def _size_panels(self):
-        """Cap panel sizes to screen dimensions so they don't exceed the screen."""
-        screen = self.screen()
-        if not screen:
-            return
-        available = screen.availableGeometry()
-        # Subtract margins, spacing, and status bar
-        margins = self.grid_layout.contentsMargins()
-        available_w = available.width() - margins.left() - margins.right() - 16
-        available_h = available.height() - margins.top() - margins.bottom() - 64
-
-        layout_name = _normalize_layout_name(self.config.get("grid_layout", "2x3"))
-        layout_def = GRID_LAYOUTS.get(layout_name, GRID_LAYOUTS["2x3"])
-        special_layout = layout_def.get("layout")
-
-        if special_layout:
-            # For special layouts, the big panel gets more height
-            # Small panels get 1/3 of available height, big panel gets 1/3
-            small_max_h = available_h // 3
-            for panel in self.panels:
-                panel.setMaximumSize(available_w, small_max_h)
-            # Make the first panel (big one) span full width
-            if self.panels:
-                self.panels[0].setMaximumSize(available_w, available_h // 3)
-        else:
-            rows = int(layout_def["rows"])
-            cols = int(layout_def["cols"])
-            cell_w = available_w // cols
-            cell_h = available_h // rows
-            for panel in self.panels:
-                panel.setMaximumSize(cell_w, cell_h)
-
     def _build_special_grid(self, rows: int, cols: int, layout: str, num_cameras: int):
         """Build special grid layouts (1 big + N small)."""
         if layout == "1big_5small":
@@ -386,7 +364,7 @@ class CameraWall(QMainWindow):
                 cam = self.config["cameras"][0]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
                 rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, 0, 0, 1, cols)
                 self.panels.append(panel)
             for idx in range(1, min(num_cameras, 6)):
@@ -395,7 +373,7 @@ class CameraWall(QMainWindow):
                 cam = self.config["cameras"][idx]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
                 rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, row, col)
                 self.panels.append(panel)
 
@@ -404,7 +382,7 @@ class CameraWall(QMainWindow):
                 cam = self.config["cameras"][0]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
                 rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, 0, 0, 1, cols)
                 self.panels.append(panel)
             for idx in range(1, min(num_cameras, 4)):
@@ -413,7 +391,7 @@ class CameraWall(QMainWindow):
                 cam = self.config["cameras"][idx]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
                 rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, row, col)
                 self.panels.append(panel)
 
@@ -422,7 +400,7 @@ class CameraWall(QMainWindow):
                 cam = self.config["cameras"][0]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
                 rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, 0, 0, 1, cols)
                 self.panels.append(panel)
             for idx in range(1, min(num_cameras, 3)):
@@ -431,7 +409,7 @@ class CameraWall(QMainWindow):
                 cam = self.config["cameras"][idx]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
                 rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, row, col)
                 self.panels.append(panel)
 
@@ -440,7 +418,7 @@ class CameraWall(QMainWindow):
                 cam = self.config["cameras"][0]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
                 rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, 0, 0, 1, cols)
                 self.panels.append(panel)
             for idx in range(1, min(num_cameras, 7)):
@@ -449,7 +427,7 @@ class CameraWall(QMainWindow):
                 cam = self.config["cameras"][idx]
                 stream_subtype = get_stream_subtype(cam.get("stream", "main"))
                 rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
+                panel = VLCPanel(cam["name"], rtsp_url, self)
                 self.grid_layout.addWidget(panel, row, col)
                 self.panels.append(panel)
 
@@ -471,7 +449,7 @@ class CameraWall(QMainWindow):
             self._overall_label.setStyleSheet("color: red;")
 
     def closeEvent(self, event):
-        log.info("Shutting down...")
+        log.info("Shutting down…")
         for panel in self.panels:
             panel.stop()
         event.accept()
@@ -484,7 +462,7 @@ def main():
     app.setFont(QFont("Segoe UI", 10))
 
     window = CameraWall()
-    window.showMaximized()
+    window.show()
 
     sys.exit(app.exec())
 
