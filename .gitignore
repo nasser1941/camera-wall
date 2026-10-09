@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+dist/
+*.pkg
+*.egg-info/
+__pycache__/
+
+# Virtual environment
+.venv/
+venv/
+
+# Release distribution (too large for git)
+camera-wall-v0.1.0-linux-x86_64.tar.gz
+release/camera-wall.bin
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
