@@ -451,6 +451,7 @@ class CameraWall(QMainWindow):
         super().__init__()
         self.config = load_config()
         self.panels = []
+        self._was_special = False
         self.setWindowTitle("Dahua Camera Wall")
         self.setMinimumSize(1280, 720)
         self.resize(1600, 900)
@@ -519,41 +520,54 @@ class CameraWall(QMainWindow):
         # from the old panels are processed before we add new ones
         QTimer.singleShot(0, self._rebuild_grid)
 
-    def _build_grid(self):
-        """Build the camera grid based on current configuration."""
-        # Clear existing panels
+    def _clear_grid(self):
+        """Stop and remove all panels from the grid without relying on deleteLater()."""
         for panel in self.panels:
             panel.stop()
+            # Wait for the FrameReader thread to actually stop
+            if panel.reader.isRunning():
+                panel.reader.wait(2000)
             self.grid_layout.removeWidget(panel)
+            panel.setParent(None)
             panel.deleteLater()
         self.panels.clear()
 
+    def _build_grid(self):
+        """Build the camera grid based on current configuration."""
         # Get grid dimensions
         layout_name = _normalize_layout_name(self.config.get("grid_layout", "2x3"))
         layout_def = GRID_LAYOUTS.get(layout_name, GRID_LAYOUTS["2×3"])
-        rows = layout_def["rows"]
-        cols = layout_def["cols"]
+        rows: int = int(layout_def["rows"])
+        cols: int = int(layout_def["cols"])
         special_layout = layout_def.get("layout")
 
-        # Calculate needed cells
-        num_cameras = len(self.config["cameras"])
+        # Check if we're switching between standard and special layouts
+        is_special = special_layout is not None
+        was_special = getattr(self, "_was_special", False)
 
-        if special_layout:
-            # Special layouts like 1+5, 1+3, etc.
-            self._build_special_grid(rows, cols, special_layout, num_cameras)
+        if is_special != was_special:
+            # Layout type changed — must clear and rebuild
+            log.info("Switching from %s to %s layout — clearing grid",
+                     "special" if was_special else "standard",
+                     "special" if is_special else "standard")
+            self._clear_grid()
+            self._was_special = is_special
+        elif is_special:
+            # Special → special: clear and rebuild (grid structure changes)
+            log.info("Switching special layout: %s", layout_name)
+            self._clear_grid()
         else:
-            # Standard grid
-            for idx in range(num_cameras):
-                row = idx // cols
-                col = idx % cols
-                if row >= rows or col >= cols:
-                    break
-                cam = self.config["cameras"][idx]
-                stream_subtype = get_stream_subtype(cam.get("stream", "main"))
-                rtsp_url = build_rtsp_url(cam["ip"], cam.get("username", "admin"), cam.get("password", ""), channel=1, subtype=stream_subtype)
-                panel = CameraPanel(cam["name"], rtsp_url, self)
-                self.grid_layout.addWidget(panel, row, col)
-                self.panels.append(panel)
+            # Standard → standard: update panels in place
+            self._update_standard_grid(rows, cols)
+            self._was_special = False
+
+        # Build panels if we cleared above
+        if not self.panels:
+            num_cameras = len(self.config["cameras"])
+            if is_special:
+                self._build_special_grid(rows, cols, special_layout, num_cameras)
+            else:
+                self._build_standard_grid(rows, cols)
 
         # Adjust column/row stretches
         for i in range(cols):
@@ -562,6 +576,79 @@ class CameraWall(QMainWindow):
             self.grid_layout.setRowStretch(i, 1)
 
         self._update_overall_status()
+
+    def _update_standard_grid(self, rows: int, cols: int):
+        """Update existing panels for a standard grid (no layout type change)."""
+        num_cameras = len(self.config["cameras"])
+        total_cells = rows * cols
+        needed = min(num_cameras, total_cells)
+
+        # Update existing panels in place
+        for idx in range(min(len(self.panels), needed)):
+            row = idx // cols
+            col = idx % cols
+            cam = self.config["cameras"][idx]
+            stream_subtype = get_stream_subtype(cam.get("stream", "main"))
+            rtsp_url = build_rtsp_url(
+                cam["ip"], cam.get("username", "admin"),
+                cam.get("password", ""), channel=1, subtype=stream_subtype
+            )
+            panel = self.panels[idx]
+            # Stop old thread before restarting with new URL
+            panel.stop()
+            if panel.reader.isRunning():
+                panel.reader.wait(2000)
+            panel.camera_name = cam["name"]
+            panel.rtsp_url = rtsp_url
+            panel.status_label.setText("Connecting…")
+            panel.video_label.clear()
+            # Reposition in grid
+            self.grid_layout.removeWidget(panel)
+            self.grid_layout.addWidget(panel, row, col)
+            panel.start()
+
+        # Remove excess panels
+        for idx in range(needed, len(self.panels)):
+            panel = self.panels[idx]
+            panel.stop()
+            if panel.reader.isRunning():
+                panel.reader.wait(2000)
+            self.grid_layout.removeWidget(panel)
+            panel.setParent(None)
+            panel.deleteLater()
+        del self.panels[needed:]
+
+        # Add new panels for extra cameras
+        for idx in range(len(self.panels), needed):
+            row = idx // cols
+            col = idx % cols
+            cam = self.config["cameras"][idx]
+            stream_subtype = get_stream_subtype(cam.get("stream", "main"))
+            rtsp_url = build_rtsp_url(
+                cam["ip"], cam.get("username", "admin"),
+                cam.get("password", ""), channel=1, subtype=stream_subtype
+            )
+            panel = CameraPanel(cam["name"], rtsp_url, self)
+            self.grid_layout.addWidget(panel, row, col)
+            self.panels.append(panel)
+            panel.start()
+
+    def _build_standard_grid(self, rows: int, cols: int):
+        """Build a standard grid from scratch."""
+        num_cameras = len(self.config["cameras"])
+        total_cells = rows * cols
+        for idx in range(min(num_cameras, total_cells)):
+            row = idx // cols
+            col = idx % cols
+            cam = self.config["cameras"][idx]
+            stream_subtype = get_stream_subtype(cam.get("stream", "main"))
+            rtsp_url = build_rtsp_url(
+                cam["ip"], cam.get("username", "admin"),
+                cam.get("password", ""), channel=1, subtype=stream_subtype
+            )
+            panel = CameraPanel(cam["name"], rtsp_url, self)
+            self.grid_layout.addWidget(panel, row, col)
+            self.panels.append(panel)
 
     def _build_special_grid(self, rows: int, cols: int, layout: str, num_cameras: int):
         """Build special grid layouts (1 big + N small)."""
