@@ -308,9 +308,10 @@ class CameraWall(QMainWindow):
         # Build grid from config
         self._build_grid()
 
-        # Start all streams after a short delay
+        # Start all streams and size panels after the window is shown
         from PyQt6.QtCore import QTimer
-        QTimer.singleShot(1000, self._start_all)
+        QTimer.singleShot(100, self._start_all)
+        QTimer.singleShot(200, self._size_panels)
 
     def _build_grid(self):
         """Build the camera grid based on current configuration."""
@@ -345,6 +346,38 @@ class CameraWall(QMainWindow):
             self.grid_layout.setRowStretch(i, 1)
 
         self._update_overall_status()
+
+    def _size_panels(self):
+        """Cap panel sizes to screen dimensions so they don't exceed the screen."""
+        screen = self.screen()
+        if not screen:
+            return
+        available = screen.availableGeometry()
+        # Subtract margins, spacing, and status bar
+        margins = self.grid_layout.contentsMargins()
+        available_w = available.width() - margins.left() - margins.right() - 16
+        available_h = available.height() - margins.top() - margins.bottom() - 64
+
+        layout_name = _normalize_layout_name(self.config.get("grid_layout", "2x3"))
+        layout_def = GRID_LAYOUTS.get(layout_name, GRID_LAYOUTS["2x3"])
+        special_layout = layout_def.get("layout")
+
+        if special_layout:
+            # For special layouts, the big panel gets more height
+            # Small panels get 1/3 of available height, big panel gets 1/3
+            small_max_h = available_h // 3
+            for panel in self.panels:
+                panel.setMaximumSize(available_w, small_max_h)
+            # Make the first panel (big one) span full width
+            if self.panels:
+                self.panels[0].setMaximumSize(available_w, available_h // 3)
+        else:
+            rows = int(layout_def["rows"])
+            cols = int(layout_def["cols"])
+            cell_w = available_w // cols
+            cell_h = available_h // rows
+            for panel in self.panels:
+                panel.setMaximumSize(cell_w, cell_h)
 
     def _build_special_grid(self, rows: int, cols: int, layout: str, num_cameras: int):
         """Build special grid layouts (1 big + N small)."""
