@@ -57,6 +57,16 @@ GRID_LAYOUTS = {
     "1+6": {"rows": 3, "cols": 4, "layout": "1big_6small"},
 }
 
+# Normalized lookup: maps ASCII 'x' versions to Unicode keys
+_GRID_LAYOUT_NORMALIZATION = {
+    k.replace("×", "x"): k for k in GRID_LAYOUTS.keys()
+}
+
+
+def _normalize_layout_name(name: str) -> str:
+    """Normalize a layout name for dictionary lookup."""
+    return _GRID_LAYOUT_NORMALIZATION.get(name, name)
+
 # ── Configuration file path ────────────────────────────────────────────
 def get_config_path() -> Path:
     """Get the path to the configuration file."""
@@ -75,6 +85,9 @@ def load_config() -> Dict[str, Any]:
             # Validate required keys
             if "grid_layout" not in config:
                 config["grid_layout"] = "2x3"
+            else:
+                # Normalize to Unicode key for consistency
+                config["grid_layout"] = _normalize_layout_name(config["grid_layout"])
             if "cameras" not in config or not config["cameras"]:
                 config["cameras"] = DEFAULT_CONFIG["cameras"]
             log.info("Loaded config from %s", config_path)
@@ -491,7 +504,8 @@ class CameraWall(QMainWindow):
 
     def _update_grid_selector(self):
         """Update the toolbar grid selector to match current config."""
-        layout_name = self.config.get("grid_layout", "2x3")
+        raw = self.config.get("grid_layout", "2x3")
+        layout_name = _normalize_layout_name(raw)
         idx = self.grid_selector.findText(layout_name)
         if idx >= 0:
             self.grid_selector.setCurrentIndex(idx)
@@ -511,8 +525,8 @@ class CameraWall(QMainWindow):
         self.panels.clear()
 
         # Get grid dimensions
-        layout_name = self.config.get("grid_layout", "2x3")
-        layout_def = GRID_LAYOUTS.get(layout_name, GRID_LAYOUTS["2x3"])
+        layout_name = _normalize_layout_name(self.config.get("grid_layout", "2x3"))
+        layout_def = GRID_LAYOUTS.get(layout_name, GRID_LAYOUTS["2×3"])
         rows = layout_def["rows"]
         cols = layout_def["cols"]
         special_layout = layout_def.get("layout")
