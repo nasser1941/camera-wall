@@ -157,7 +157,8 @@ class FrameReader(QThread):
 
     def stop(self):
         self._running = False
-        self.wait(3000)
+        # Don't block the calling thread — let the thread exit naturally
+        # when it checks _running in its loop
 
     def _set_status(self, status: str):
         self.status_changed.emit(self.camera_name, status)
@@ -499,7 +500,8 @@ class CameraWall(QMainWindow):
         dialog = ConfigDialog(self.config, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.config = dialog.get_config()
-            self._rebuild_grid()
+            # Defer so deleteLater() events are processed
+            QTimer.singleShot(0, self._rebuild_grid)
             self._update_grid_selector()
 
     def _update_grid_selector(self):
@@ -513,7 +515,9 @@ class CameraWall(QMainWindow):
     def _on_grid_changed(self, layout_name: str):
         """Handle grid layout change from toolbar."""
         self.config["grid_layout"] = layout_name
-        self._rebuild_grid()
+        # Defer to next event loop iteration so deleteLater() events
+        # from the old panels are processed before we add new ones
+        QTimer.singleShot(0, self._rebuild_grid)
 
     def _build_grid(self):
         """Build the camera grid based on current configuration."""
