@@ -1,0 +1,47 @@
+{
+  "grid": "2x3",
+  "cameras": [
+    {
+      "name": "Camera 1",
+      "ip": "192.168.1.101",
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "stream": "main"
+    },
+    {
+      "name": "Camera 2",
+      "ip": "192.168.1.102",
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "stream": "main"
+    },
+    {
+      "name": "Camera 3",
+      "ip": "192.168.1.103",
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "stream": "main"
+    },
+    {
+      "name": "Camera 4",
+      "ip": "192.168.1.104",
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "stream": "main"
+    },
+    {
+      "name": "Camera 5",
+      "ip": "192.168.1.105",
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "stream": "main"
+    },
+    {
+      "name": "Camera 6",
+      "ip": "192.168.1.106",
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "stream": "main"
+    }
+  ]
+}

@@ -1,6 +1,13 @@
+# Your configuration holds camera passwords: never commit it
+config.json
+*.config.json
+
 # Build artifacts
 build/
 dist/
+release/
+*.spec
+*.tar.gz
 *.pkg
 *.egg-info/
 __pycache__/
@@ -8,10 +15,6 @@ __pycache__/
 # Virtual environment
 .venv/
 venv/
-
-# Release distribution (too large for git)
-camera-wall-v0.1.0-linux-x86_64.tar.gz
-release/camera-wall.bin
 
 # IDE
 .idea/
