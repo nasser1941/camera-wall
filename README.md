@@ -1,117 +1,101 @@
 # camera-wall
 
-Multi-camera live viewer for Dahua IP cameras.
+Live view of Dahua IP cameras in a grid. It plays each camera's RTSP stream directly (no NVR
+needed), reconnects on its own when a stream drops, and fits the window to your screen.
 
-Shows cameras in a grid layout that fills the screen. Each camera cell
-stretches to fill its available space while preserving aspect ratio.
-
-## Quick Start
+## Run it
 
 ```bash
-# Unpack the tarball
-tar xzf camera-wall-v0.1.0-linux-x86_64.tar.gz
-
-# Run
-./release/camera-wall
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python camera_wall.py
 ```
 
-Or run directly from source:
+The first time, there's no configuration yet: the app writes an example to
+`~/.camera_wall/config.json` and tells you so. Put your cameras in it (below) and start it again.
 
-```bash
-pip install -r requirements.txt
-python camera_wall.py
-```
+The window opens at 90% of the screen it starts on. Each video is scaled into its cell, so you can
+maximize the window, move it to another screen or resize it freely.
 
-## Configuration
-
-All settings live in a single JSON file:
-
-```
-~/.camera_wall/config.json
-```
-
-If the file doesn't exist, the app starts with 6 default cameras in a
-2×3 grid.
-
-### Default config
+## The configuration file
 
 ```json
 {
-  "grid_layout": "2x3",
+  "grid": "2x3",
   "cameras": [
-    {
-      "name": "Camera 1",
-      "ip": "172.16.1.110",
-      "username": "admin",
-      "password": "your_password",
-      "stream": "main"
-    }
+    {"name": "Main door", "ip": "192.168.1.101", "username": "admin", "password": "CHANGE_ME", "stream": "main"},
+    {"name": "Parking",   "ip": "192.168.1.102", "username": "admin", "password": "CHANGE_ME", "stream": "main"}
   ]
 }
 ```
 
-### Adding cameras
+[`config.example.json`](config.example.json) has a complete example with six cameras.
 
-Add entries to the `"cameras"` array. Each entry needs:
+The app looks for the file in this order:
 
-| Field      | Description                              |
-|------------|------------------------------------------|
-| `name`     | Display name (shown in the status label) |
-| `ip`       | Camera IP address                        |
-| `username` | RTSP username (e.g. `admin`)             |
-| `password` | RTSP password                            |
-| `stream`   | `main` (high quality) or `sub` (low)     |
+1. the path you give with `--config`, e.g. `camera_wall.py --config ~/office-cameras.json`;
+2. the `CAMERA_WALL_CONFIG` environment variable;
+3. `~/.camera_wall/config.json`.
 
-Example with 9 cameras in a 3×3 grid:
+It holds your cameras' passwords, so keep it out of git (`config.json` is in `.gitignore`) and
+readable only by you: `chmod 600 ~/.camera_wall/config.json`.
 
-```json
-{
-  "grid_layout": "3x3",
-  "cameras": [
-    {"name": "Front Gate", "ip": "172.16.1.110", "username": "admin", "password": "***REMOVED***", "stream": "main"},
-    {"name": "Parking Lot", "ip": "172.16.1.111", "username": "admin", "password": "***REMOVED***", "stream": "main"},
-    {"name": "Entrance", "ip": "172.16.1.112", "username": "admin", "password": "***REMOVED***", "stream": "main"},
-    {"name": "Back Door", "ip": "172.16.1.113", "username": "admin", "password": "***REMOVED***", "stream": "main"},
-    {"name": "Corridor A", "ip": "172.16.1.114", "username": "admin", "password": "***REMOVED***", "stream": "main"},
-    {"name": "Corridor B", "ip": "172.16.1.115", "username": "admin", "password": "***REMOVED***", "stream": "main"},
-    {"name": "Lobby", "ip": "172.16.1.116", "username": "admin", "password": "***REMOVED***", "stream": "main"},
-    {"name": "Roof", "ip": "172.16.1.117", "username": "admin", "password": "***REMOVED***", "stream": "main"},
-    {"name": "Loading Bay", "ip": "172.16.1.118", "username": "admin", "password": "***REMOVED***", "stream": "main"}
-  ]
-}
+### Adding a camera
+
+Add an entry to `cameras`. Cameras fill the grid left to right, top to bottom, in the order of the
+list.
+
+| Field | | Default |
+|---|---|---|
+| `ip` | The camera's address (required) | |
+| `name` | Shown under the video | `Camera N` |
+| `username`, `password` | The camera's login | `admin`, empty |
+| `stream` | `main` (full quality) or `sub` (lighter: use it for many cameras or a slow network) | `main` |
+| `channel` | The channel, for a camera or encoder with several | `1` |
+| `port` | The RTSP port | `554` |
+
+### Changing the grid
+
+Set `grid` to `rows x columns`, from `1x1` to `8x8`:
+
+| `grid` | Cameras |
+|---|---|
+| `2x3` | 6 (the default) |
+| `3x3` | 9 |
+| `3x4` | 12 |
+| `4x4` | 16 |
+
+With more cameras than cells, the first ones are shown; empty cells say "No camera". To try a
+grid without editing the file: `camera_wall.py --grid 3x3`.
+
+More cameras at full quality take more network and CPU. If the video stutters, switch some
+cameras to `"stream": "sub"`.
+
+## Status
+
+The border and the line under each video show its state: grey while connecting, green when
+connected, orange while reconnecting, red when it keeps failing (check the camera's address,
+login and RTSP settings). The status bar counts the connected cameras.
+
+## A single-file build
+
+```bash
+.venv/bin/pip install pyinstaller
+.venv/bin/pyinstaller --name camera-wall --windowed --onefile camera_wall.py
+./dist/camera-wall
 ```
 
-### Changing the grid layout
-
-Set `"grid_layout"` to one of:
-
-| Value   | Layout          | Description                  |
-|---------|-----------------|------------------------------|
-| `1x1`   | 1×1             | Single camera, full screen   |
-| `2x2`   | 2×2             | 4 cameras                    |
-| `3x3`   | 3×3             | 9 cameras                    |
-| `4x4`   | 4×4             | 16 cameras                   |
-| `2x3`   | 2×3             | 6 cameras (default)          |
-| `3x2`   | 3×2             | 6 cameras (portrait)         |
-| `1+5`   | 1 big + 5 small | Spotlight camera + 5 others  |
-| `1+3`   | 1 big + 3 small | Spotlight camera + 3 others  |
-| `1+2`   | 1 big + 2 small | Spotlight camera + 2 others  |
-| `1+6`   | 1 big + 6 small | Spotlight camera + 6 others  |
-
-After editing the config file, restart the app for changes to take effect.
-
-### Stream selection
-
-- `main` — high-resolution main stream (default)
-- `sub` — low-resolution sub stream (better for many cameras or limited bandwidth)
+The build reads the same configuration file; nothing about your cameras is built into it.
 
 ## Troubleshooting
 
-- **Camera shows "Reconnecting..."**: Check that the IP, username, and
-  password are correct. Dahua cameras accept at most 6 simultaneous RTSP
-  connections by default.
-- **No video but status says "Connected"**: Try switching the camera
-  stream from `main` to `sub` — some Dahua firmware versions have issues
-  with the main stream over RTSP.
-- **App won't start**: Make sure you have the required libraries:
-  `opencv-python-headless`, `PyQt6`, and `numpy`.
+- **No video:** check that the camera answers (`ping 192.168.1.101`) and that RTSP is on in its
+  settings.
+- **"Error — check the camera":** the login is wrong, or the camera allows no more RTSP
+  connections (close other viewers).
+- **Stuttering:** use `"stream": "sub"` for some cameras.
+- **Logs:** run it from a terminal to see what each camera does (passwords are masked).
+
+## License
+
+MIT
