@@ -2,15 +2,30 @@
 config.json
 *.config.json
 
+# Never commit credentials of any kind
+client_secret*.json
+*.keystore
+*.jks
+
 # Build artifacts
 build/
 dist/
 release/
 *.spec
+!buildozer.spec
 *.tar.gz
 *.pkg
 *.egg-info/
 __pycache__/
+.pytest_cache/
+
+# Android build (buildozer / python-for-android output, SDK/NDK downloads)
+.buildozer/
+bin/
+*.apk
+*.aab
+android-ndk-*/
+android-ndk-*.zip
 
 # Virtual environment
 .venv/
@@ -25,3 +40,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Default config built into an APK by build_android.sh --config (temporary)
+camera_wall/bundled_config.json
