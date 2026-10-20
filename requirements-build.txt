@@ -1,0 +1,4 @@
+# Tools to build the Android APK (./build_android.sh installs them into .venv).
+# python-for-android itself is fetched by buildozer, pinned in buildozer.spec.
+buildozer==1.6.0
+Cython>=0.29,<3.2

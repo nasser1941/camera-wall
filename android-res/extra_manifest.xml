@@ -1,0 +1,3 @@
+<!-- Runs on Android TV, but doesn't require it, nor a touchscreen (TVs have a remote). -->
+<uses-feature android:name="android.software.leanback" android:required="false" />
+<uses-feature android:name="android.hardware.touchscreen" android:required="false" />
