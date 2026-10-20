@@ -1,9 +1,10 @@
 # Camera Wall — Agent Guide
 
 ## Overview
-Live RTSP camera grid viewer for Dahua IP cameras. Two apps, one config format:
-- **Desktop (Linux):** PyQt6 + OpenCV — single file `camera_wall.py` (standalone, doesn't import the package)
-- **Android (TV / Google TV / ChromeOS / phones):** Kivy + PyAV — package `camera_wall/`, built with buildozer
+Live RTSP camera grid viewer for Dahua IP cameras. Two apps, one config format, one video engine:
+- **Desktop (Linux):** PyQt6 window — `camera_wall.py`, using the package's config + reader
+- **Android (TV / Google TV / ChromeOS / phones):** Kivy UI in the package `camera_wall/`, built with buildozer
+- **Shared (`camera_wall/` package):** config, PyAV reader (hardware decoding, skip-to-live, scaling)
 
 Config holds camera IPs, credentials and grid layout. Streams auto-reconnect.
 
@@ -50,7 +51,7 @@ there from Android 11 on (verified on an API 30 emulator).
 
 ```
 camera-wall/
-├── camera_wall.py              # Desktop app (PyQt6 + OpenCV), self-contained
+├── camera_wall.py              # Desktop app (PyQt6 window; imports the camera_wall package)
 ├── camera_wall/                # Android app (Kivy + PyAV)
 │   ├── __init__.py             # __version__ (buildozer reads the APK version from here)
 │   ├── __main__.py             # entry: env/logging/Kivy config, then CameraWallApp
@@ -81,6 +82,14 @@ camera-wall/
   at 30 Hz from `CameraWall._refresh` — no Kivy calls from background threads, frames dropped naturally.
 - **Frames are pre-scaled** in the reader to the cell's size (`set_output_size`, never enlarged) to keep
   texture uploads small on TV hardware.
+- **Hardware decoder order** (`HARDWARE_DECODERS`): `*_mediacodec` (Android) → `*_cuvid` (NVIDIA NVDEC) →
+  `*_qsv` (Intel); each FFmpeg build has only its platform's (PyAV desktop wheels: cuvid, qsv). cuvid also
+  scales on the GPU (`resize` option = the cell size, `GPU_SCALING`); the decoder is re-made at the next
+  keyframe when the cell size changes >10%. A decoder failing before its first picture (FFmpeg error, or
+  none after `HARDWARE_PATIENCE` packets) hands over to the next candidate at the next keyframe, same
+  connection. `_decoder_results`: a decoder that failed twice and never worked is skipped process-wide.
+  Desktop (this PC, 6× 2560x1440 HEVC): OpenCV app 482% CPU → cuvid + GPU scaling 42%.
+  Intel QSV here fails ("Function not implemented"): Raptor Lake needs `libmfx-gen1.2`.
 - **Hardware decoding (Android):** FFmpeg's `h264_mediacodec`/`hevc_mediacodec`, created with
   `av.CodecContext.create(name, "r")` + the stream's extradata/size. No JavaVM is registered, so FFmpeg uses
   the NDK AMediaCodec API (libmediandk) — no JNI needed. `hardware.hardware_decoder_limit()` reads
@@ -108,6 +117,9 @@ camera-wall/
 - **Grid parsing** accepts `2x3`, `2×3`, `2 X 3`. Config key can be `grid` or `grid_layout`.
 - **RTSP URL:** `rtsp://{user}:{pass}@{ip}:{port}/cam/realmonitor?channel={ch}&subtype={st}&unicast=true&proto=Onvif`
   (subtype 0 = main, 1 = sub). Credentials are URL-quoted.
+- **Desktop app = same reader:** the Qt panel polls `latest_frame()` every 33 ms and shows the frame as
+  is (already scaled to the label's physical pixels, `devicePixelRatioF`); no OpenCV any more.
+  `python camera_wall.py` imports the *package* `camera_wall` (a package beats a same-named module).
 - **Android performance:** use `"stream": "sub"` on TV boxes (main streams are often 4 MP H.265), set to
   H.264, D1, 15 fps, CBR ~1024 kb/s, GOP 2×fps; plus `"aspect_ratio": "16:9"` for D1. TV CPUs (e.g. TCL
   Google TV, 4× ARM, 32-bit userland) can't decode even 5 D1 H.265 streams in software in real time.

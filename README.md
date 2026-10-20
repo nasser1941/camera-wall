@@ -3,11 +3,14 @@
 Live view of Dahua IP cameras in a grid. Plays each camera's RTSP stream directly (no NVR needed),
 reconnects automatically, and fits the screen.
 
-Two apps, one configuration file:
+Two apps, one configuration file, one video engine (PyAV/FFmpeg, in the `camera_wall/` package):
 
-- **Desktop (Linux):** `camera_wall.py`, PyQt6 + OpenCV.
-- **Android:** the `camera_wall/` package, Kivy + PyAV (FFmpeg), built into an APK for Android TV,
-  Google TV / Chromecast, ChromeOS, phones and tablets.
+- **Desktop (Linux):** `camera_wall.py`, a PyQt6 window.
+- **Android:** a Kivy app, built into an APK for Android TV, Google TV / Chromecast, ChromeOS,
+  phones and tablets.
+
+Both decode on the video hardware when there is some (NVIDIA or Intel graphics on a PC,
+MediaCodec on Android) and fall back to the processor by themselves.
 
 ---
 
@@ -26,6 +29,20 @@ The first time, there's no configuration yet: the app writes an example to
 
 The window opens at 90% of the screen it starts on. Each video is scaled into its cell, so you can
 maximize the window, move it to another screen or resize it freely.
+
+### Graphics card decoding
+
+With an NVIDIA graphics card (and its driver), the GPU decodes the streams *and* scales each one
+down to its cell, so the processor hardly works: six 2560×1440 H.265 cameras take about 0.4 of a
+core instead of almost 5. Without one, Intel Quick Sync is tried (it needs Intel's oneVPL GPU
+runtime, `sudo apt install libmfx-gen1.2`), then the processor. The terminal log says which one
+each camera uses:
+
+```
+Camera 1: connected, hevc 2560x1440, hardware decoding (hevc_cuvid, scaled on the GPU to 1098x618)
+```
+
+To decode on the processor only, set `"hardware_decoders": 0` in the config.
 
 ### Single-file build (PyInstaller)
 
@@ -212,10 +229,8 @@ anywhere. To check a file without starting anything: `python3 -m camera_wall --c
 | Key | | Default |
 |---|---|---|
 | `grid` | Rows x columns, see below | `2x3` |
-| `aspect_ratio` | The pictures' real shape, e.g. `"16:9"`, for sub streams that squeeze it (Android app) | as each stream says |
-| `hardware_decoders` | At most this many cameras on the device's video hardware (Android app); `0` turns it off | as many as the device allows |
-
-The desktop app ignores the two Android settings, so one file can serve both.
+| `aspect_ratio` | The pictures' real shape, e.g. `"16:9"`, for sub streams that squeeze it | as each stream says |
+| `hardware_decoders` | At most this many cameras on the video hardware; `0` turns hardware decoding off | as many as the device allows (all on a PC) |
 
 ### Adding a camera
 
@@ -230,7 +245,7 @@ list.
 | `stream` | `main` (full quality) or `sub` (lighter: use it for many cameras, a slow network or Android) | `main` |
 | `channel` | The channel, for a camera or encoder with several | `1` |
 | `port` | The RTSP port | `554` |
-| `aspect_ratio` | This camera's real picture shape, overriding the wall's (Android app) | the wall's |
+| `aspect_ratio` | This camera's real picture shape, overriding the wall's | the wall's |
 
 ### Changing the grid
 
@@ -267,6 +282,8 @@ login and RTSP settings). The status bar counts the connected cameras.
   login or stream is wrong, or the camera allows no more RTSP connections (close other viewers).
   Avoid retrying a wrong password many times: Dahua cameras lock the account for a while.
 - **Stuttering:** use `"stream": "sub"` for some cameras (on Android, for all of them).
+- **High CPU on the PC:** check the log for `hardware decoding (hevc_cuvid …)`; if it says
+  software, the NVIDIA driver (or Intel's runtime, see above) isn't available to FFmpeg.
 - **Logs:** run the desktop app from a terminal; on Android, read
   `adb shell run-as org.camerawall.camerawall cat files/camera_wall.log` (passwords are masked).
 - **Android video lags or stutters:** use H.264 sub streams at 15 fps (see above); the log shows

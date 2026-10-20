@@ -173,3 +173,12 @@ def test_aspect_ratio_for_all_cameras_and_per_camera(tmp_path):
     })
     ratios = [cam["aspect_ratio"] for cam in load_config(path)["cameras"]]
     assert ratios == [pytest.approx(16 / 9), pytest.approx(4 / 3), None]
+
+
+def test_write_example_is_a_valid_private_config(tmp_path):
+    from camera_wall.config import write_example
+
+    path = tmp_path / "sub" / "config.json"
+    write_example(path)
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert len(load_config(path)["cameras"]) == 6

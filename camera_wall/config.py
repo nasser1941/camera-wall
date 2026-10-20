@@ -20,6 +20,16 @@ CONFIG_ENV = "CAMERA_WALL_CONFIG"
 CONFIG_NAME = "config.json"
 
 
+# What the desktop app writes on its first run, for the user to fill in.
+EXAMPLE_CONFIG: dict = {
+    "grid": DEFAULT_GRID,
+    "cameras": [
+        {"name": f"Camera {i}", "ip": f"192.168.1.{100 + i}", "username": "admin", "password": "CHANGE_ME", "stream": "main"}
+        for i in range(1, 7)
+    ],
+}
+
+
 class ConfigError(Exception):
     """The configuration file exists but can't be used."""
 
@@ -174,3 +184,11 @@ def load_config(path: Path, grid_override: str | None = None) -> dict:
         raise ConfigError('"hardware_decoders" must be a whole number, 0 or more (0 turns it off)')
 
     return {"rows": rows, "cols": cols, "cameras": cameras, "hardware_decoders": hardware_decoders}
+
+
+def write_example(path: Path) -> None:
+    """Write an example config for the user to fill in, readable only by them (it will hold
+    camera passwords)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(EXAMPLE_CONFIG, indent=2) + "\n", encoding="utf-8")
+    path.chmod(0o600)

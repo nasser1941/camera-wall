@@ -8,10 +8,11 @@ The UI thread never waits on a camera: it reads the newest frame and status when
 redraws (:meth:`CameraReader.latest_frame`, :attr:`CameraReader.status`), so a slow or dead
 camera can't freeze the wall, and frames the screen has no time for are simply skipped.
 
-On Android a reader can decode with the device's video hardware (MediaCodec, through FFmpeg's
-*_mediacodec decoders), which TV processors badly need for H.265. Devices only run a few of
-those at once, so the wall decides which cameras get one (see hardware.py); a camera whose
-hardware decoder fails goes back to software decoding by itself.
+Readers decode with the video hardware when there is some: Android's MediaCodec (TV
+processors badly need it for H.265), an NVIDIA GPU (NVDEC, which also scales the frames down
+to the cell's size) or Intel Quick Sync. A decoder that doesn't work hands over to the next
+one, down to software decoding, by itself. Android devices only run a few hardware decoders
+at once, so there the wall decides which cameras get one (see hardware.py).
 """
 
 from __future__ import annotations
@@ -45,10 +46,26 @@ MAX_LAG = 1.5
 # ... and resume decoding at a keyframe no more than this far behind.
 CATCH_UP_LAG = 0.5
 
-# Android MediaCodec decoders in FFmpeg, by codec. FFmpeg on desktops doesn't have them.
-HARDWARE_DECODERS = {"h264": "h264_mediacodec", "hevc": "hevc_mediacodec"}
+# Hardware decoders by codec, best first: Android's MediaCodec, NVIDIA's NVDEC (cuvid), Intel's
+# Quick Sync (qsv). Each FFmpeg build has only some: python-for-android's has MediaCodec,
+# PyAV's desktop wheels have cuvid and qsv.
+HARDWARE_DECODERS = {
+    "h264": ("h264_mediacodec", "h264_cuvid", "h264_qsv"),
+    "hevc": ("hevc_mediacodec", "hevc_cuvid", "hevc_qsv"),
+}
+# Decoders that also scale the frames down on the GPU (their "resize" option), which spares the
+# CPU most of the work per frame.
+GPU_SCALING = frozenset({"h264_cuvid", "hevc_cuvid"})
+# Re-make a GPU-scaling decoder when the cell's size changes by more than this fraction.
+RESCALE_THRESHOLD = 0.1
 # Packets a hardware decoder may take to show its first picture before we give up on it (~5 s).
 HARDWARE_PATIENCE = 125
+
+# Which hardware decoders worked or failed in this process. One that has failed twice and never
+# worked doesn't work on this machine, and other cameras skip it. (A failure after others worked
+# is a limit on how many run at once, which only concerns the camera that hit it.)
+_decoder_results: dict[str, list[int]] = {}  # name -> [successes, failures]
+_decoder_results_lock = threading.Lock()
 
 # Status colours, by name; the UI maps them to real colours.
 GREY, GREEN, ORANGE, RED = "grey", "green", "orange", "red"
@@ -96,14 +113,32 @@ def stream_aspect(codec) -> float | None:
     return codec.width * float(sar) / codec.height
 
 
-def hardware_decoder_name(codec_name: str) -> str | None:
-    """The FFmpeg decoder that uses the device's video hardware for ``codec_name``, if any."""
-    name = HARDWARE_DECODERS.get(codec_name)
-    return name if name is not None and name in av.codecs_available else None
+def hardware_decoder_names(codec_name: str) -> list[str]:
+    """The hardware decoders to try for ``codec_name``, best first: those this FFmpeg has, minus
+    those that turned out not to work on this machine."""
+    names = [name for name in HARDWARE_DECODERS.get(codec_name, ()) if name in av.codecs_available]
+    with _decoder_results_lock:
+        return [name for name in names if not _is_broken(name)]
 
 
-class HardwareDecoderError(RuntimeError):
-    """The hardware decoder can't decode this stream (so the camera goes back to software)."""
+def _is_broken(name: str) -> bool:
+    successes, failures = _decoder_results.get(name, (0, 0))
+    return successes == 0 and failures >= 2
+
+
+def _record_decoder_result(name: str, worked: bool) -> None:
+    with _decoder_results_lock:
+        counts = _decoder_results.setdefault(name, [0, 0])
+        counts[0 if worked else 1] += 1
+
+
+def describe_decoder(name: str | None, scaled_to: tuple[int, int] | None, threads: int) -> str:
+    """How a camera is decoded, for the log."""
+    if name is None:
+        return f"software decoding ({threads or 'auto'} thread(s))"
+    if scaled_to:
+        return f"hardware decoding ({name}, scaled on the GPU to {scaled_to[0]}x{scaled_to[1]})"
+    return f"hardware decoding ({name})"
 
 
 class LagTracker:
@@ -153,6 +188,7 @@ class CameraReader:
         self._aspect = aspect
         self._shown_aspect: float | None = None  # what _publish uses, set when connected
         self._hardware = hardware
+        self._failed_decoders: set[str] = set()  # hardware decoders that failed for this camera
         self._threads = threads
         self._lock = threading.Lock()
         self._stopping = threading.Event()
@@ -225,64 +261,113 @@ class CameraReader:
         decoder = None
         try:
             stream = container.streams.video[0]
-            decoder, how = self._open_decoder(stream)
-            hardware = decoder is not stream.codec_context
             codec = stream.codec_context
             self._shown_aspect = self._aspect or stream_aspect(codec)
+            candidates = [n for n in hardware_decoder_names(codec.name) if n not in self._failed_decoders]
+            if not self._hardware:
+                candidates = []
+            decoder, name, scaled_to = self._make_decoder(stream, candidates)
             shape = f" shown as {self._shown_aspect:.2f}:1" if self._shown_aspect else ""
-            log.info("%s: connected, %s %dx%d%s, %s", self.name, codec.name, codec.width, codec.height, shape, how)
-            pictures = 0
+            log.info(
+                "%s: connected, %s %dx%d%s, %s", self.name, codec.name, codec.width, codec.height, shape,
+                describe_decoder(name, scaled_to, self._threads),
+            )
             lag_tracker = LagTracker()
-            skipping = False
-            for packets, packet in enumerate(container.demux(stream), 1):
+            skipping = False  # dropping packets to catch up with live
+            need_keyframe = False  # dropping packets until a new decoder can start
+            shown = 0  # pictures shown since connecting
+            pictures = fed = 0  # pictures from, and packets fed to, the current decoder
+            for packet in container.demux(stream):
                 if self._stopping.is_set():
                     return
                 if packet.pts is not None and packet.time_base is not None:
                     lag = lag_tracker.lag(float(packet.pts * packet.time_base), time.monotonic())
                     if skipping and packet.is_keyframe and lag <= CATCH_UP_LAG:
                         skipping = False
-                    elif not skipping and lag > MAX_LAG and pictures:
+                    elif not skipping and lag > MAX_LAG and shown:
                         skipping = True
                         self._note_skip(lag)
                     if skipping:
                         continue  # drop it undecoded: the next keyframe starts a clean picture
+                if need_keyframe:
+                    if not packet.is_keyframe:
+                        continue
+                    need_keyframe = False
+                if scaled_to and packet.is_keyframe and self._needs_rescale(codec, scaled_to):
+                    # The cell changed size: scale on the GPU to the new size from this keyframe on
+                    decoder = None
+                    decoder, name, scaled_to = self._make_decoder(stream, [name])
+                    pictures = fed = 0
+                    log.info("%s: cell resized: %s", self.name, describe_decoder(name, scaled_to, self._threads))
+
+                failure = None
                 try:
                     frames = decoder.decode(packet)
                 except av.error.FFmpegError as exc:
-                    if hardware and not pictures:
-                        raise HardwareDecoderError(str(exc)) from exc
-                    raise
+                    if name is None or pictures:
+                        raise
+                    frames, failure = [], str(exc)
+                fed += 1
                 for frame in frames:
                     self._publish(frame)
                     pictures += 1
-                if hardware and not pictures and packets >= HARDWARE_PATIENCE:
-                    raise HardwareDecoderError(f"no picture after {packets} packets")
-        except HardwareDecoderError as exc:
-            self._hardware = False  # for good: reconnect with software decoding
-            log.warning("%s: hardware decoding failed (%s): switching to software", self.name, exc)
-            raise
+                    shown += 1
+                    if pictures == 1 and name:
+                        _record_decoder_result(name, worked=True)
+                if name and not pictures and not failure and fed >= HARDWARE_PATIENCE:
+                    failure = f"no picture after {fed} packets"
+                if failure:
+                    # Hand over to the next decoder (software at last), from the next keyframe
+                    self._failed_decoders.add(name)
+                    _record_decoder_result(name, worked=False)
+                    candidates = [n for n in candidates if n not in self._failed_decoders]
+                    decoder = None
+                    decoder, next_name, scaled_to = self._make_decoder(stream, candidates)
+                    log.warning(
+                        "%s: %s doesn't work (%s): %s", self.name, name, failure,
+                        describe_decoder(next_name, scaled_to, self._threads),
+                    )
+                    name, pictures, fed, need_keyframe = next_name, 0, 0, True
         finally:
             decoder = None  # free the decoder now: devices have only a few hardware ones
             container.close()
 
-    def _open_decoder(self, stream):
-        """``(decoder, description)``: the hardware decoder when this reader may use one and it
-        can be created, else the stream's own (software) decoder."""
+    def _make_decoder(self, stream, candidates: list[str]):
+        """``(decoder, name, scaled_to)``: the first of the hardware decoders ``candidates`` that
+        can be created, else the stream's own software decoder (name None). ``scaled_to`` is the
+        size the decoder scales frames to on the GPU, if it does."""
         software = stream.codec_context
-        name = hardware_decoder_name(software.name) if self._hardware else None
-        if name:
+        for name in candidates:
             try:
                 decoder = av.CodecContext.create(name, "r")
                 decoder.extradata = software.extradata  # parameter sets (VPS/SPS/PPS) from RTSP
                 decoder.width, decoder.height = software.width, software.height
-                return decoder, f"hardware decoding ({name})"
-            except Exception as exc:  # noqa: BLE001 - any failure: use software
-                self._hardware = False
-                log.warning("%s: no hardware decoder (%s): using software", self.name, exc)
+                scaled_to = None
+                if name in GPU_SCALING:
+                    scaled_to = self._target_size(software)
+                    decoder.options = {"resize": f"{scaled_to[0]}x{scaled_to[1]}"}
+                return decoder, name, scaled_to
+            except Exception as exc:  # noqa: BLE001 - any failure: try the next one
+                self._failed_decoders.add(name)
+                _record_decoder_result(name, worked=False)
+                log.warning("%s: can't use %s (%s)", self.name, name, exc)
         software.thread_count = self._threads
         if self._threads != 1:
             software.thread_type = "AUTO"  # frame + slice threads
-        return software, f"software decoding ({self._threads or 'auto'} thread(s))"
+        return software, None, None
+
+    def _target_size(self, codec) -> tuple[int, int]:
+        """The size the stream's frames are shown at in the cell, as it is now."""
+        with self._lock:
+            box_width, box_height = self._box
+        return fit_size(codec.width, codec.height, box_width, box_height, self._shown_aspect)
+
+    def _needs_rescale(self, codec, scaled_to: tuple[int, int]) -> bool:
+        width, height = self._target_size(codec)
+        return (
+            abs(width - scaled_to[0]) > RESCALE_THRESHOLD * scaled_to[0]
+            or abs(height - scaled_to[1]) > RESCALE_THRESHOLD * scaled_to[1]
+        )
 
     def _publish(self, frame) -> None:
         """Scale the frame to fit the cell, convert it to RGB and make it the newest one."""

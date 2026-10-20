@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dahua Camera Wall: live view of Dahua IP cameras in a grid.
+Dahua Camera Wall: live view of Dahua IP cameras in a grid (desktop app, PyQt6).
 
 Cameras and the grid layout come from a JSON file (see README.md and config.example.json),
 looked up in this order:
@@ -10,22 +10,22 @@ looked up in this order:
 
 The window opens at 90% of the screen it starts on. Each video is scaled into its cell, so the
 window never grows past the screen; maximize or resize it as you like.
+
+The streams are read and decoded by the camera_wall package (PyAV/FFmpeg), the same code as the
+Android app. It decodes on the GPU when there is one (NVIDIA NVDEC, which also scales the frames
+down to the cell's size, or Intel Quick Sync) and falls back to the CPU by itself.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
-import re
 import sys
 import time
-from pathlib import Path
-from urllib.parse import quote
 
-import cv2
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+import numpy as np
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -40,188 +40,47 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from camera_wall.camera_reader import CameraReader, build_rtsp_url
+from camera_wall.config import ConfigError, get_config_path, load_config, write_example
+from camera_wall.hardware import hardware_decoder_limit, plan_decoders, software_threads
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("camera_wall")
 
 APP_NAME = "Dahua Camera Wall"
-DEFAULT_GRID = "2x3"
-DEFAULT_PORT = 554
-MAX_GRID = 8  # rows or columns
 WINDOW_FRACTION = 0.9  # of the screen the window opens on
-RECONNECT_DELAY = 3  # seconds between connection attempts
-ERROR_AFTER = 15  # seconds of failing before the status says "Error"
+REFRESH_MS = 33  # how often the window shows the newest frames (~30 per second)
+STOP_WAIT = 2.0  # seconds to wait in total for the cameras when the window closes
 
-GREY, ORANGE, GREEN, RED = QColor(128, 128, 128), QColor(255, 165, 0), QColor(50, 205, 50), QColor(220, 20, 60)
-
-EXAMPLE_CONFIG = {
-    "grid": DEFAULT_GRID,
-    "cameras": [
-        {"name": f"Camera {i}", "ip": f"192.168.1.{100 + i}", "username": "admin", "password": "CHANGE_ME", "stream": "main"}
-        for i in range(1, 7)
-    ],
+# Status colours by name (the reader reports names)
+COLORS = {
+    "grey": QColor(128, 128, 128),
+    "orange": QColor(255, 165, 0),
+    "green": QColor(50, 205, 50),
+    "red": QColor(220, 20, 60),
 }
-
-
-# ── Configuration ─────────────────────────────────────────────────────
-class ConfigError(Exception):
-    pass
-
-
-def config_path(given: str | None) -> Path:
-    if given:
-        return Path(given).expanduser()
-    if os.environ.get("CAMERA_WALL_CONFIG"):
-        return Path(os.environ["CAMERA_WALL_CONFIG"]).expanduser()
-    return Path.home() / ".camera_wall" / "config.json"
-
-
-def parse_grid(text: str) -> tuple[int, int]:
-    """'2x3' (or '2×3', '2 X 3') → (rows, cols)."""
-    match = re.fullmatch(r"\s*(\d+)\s*[xX×]\s*(\d+)\s*", str(text))
-    if not match:
-        raise ConfigError(f'grid must look like "2x3" (rows x columns), not {text!r}')
-    rows, cols = int(match.group(1)), int(match.group(2))
-    if not (1 <= rows <= MAX_GRID and 1 <= cols <= MAX_GRID):
-        raise ConfigError(f"grid {text!r}: rows and columns must be between 1 and {MAX_GRID}")
-    return rows, cols
-
-
-def load_config(path: Path) -> dict:
-    """The validated configuration: {"rows", "cols", "cameras": [...]}."""
-    try:
-        raw = json.loads(path.read_text())
-    except FileNotFoundError:
-        raise
-    except (OSError, ValueError) as e:
-        raise ConfigError(f"can't read {path}: {e}") from e
-    if not isinstance(raw, dict):
-        raise ConfigError(f"{path} must contain a JSON object")
-    rows, cols = parse_grid(raw.get("grid") or raw.get("grid_layout") or DEFAULT_GRID)
-    cameras = raw.get("cameras")
-    if not isinstance(cameras, list) or not cameras:
-        raise ConfigError(f'{path} needs a "cameras" list with at least one camera')
-    checked = []
-    for i, cam in enumerate(cameras, 1):
-        if not isinstance(cam, dict) or not cam.get("ip"):
-            raise ConfigError(f'camera {i} in {path} needs at least an "ip"')
-        stream = str(cam.get("stream", "main")).lower()
-        if stream not in ("main", "sub"):
-            raise ConfigError(f'camera {i}: "stream" must be "main" or "sub", not {stream!r}')
-        checked.append(
-            {
-                "name": str(cam.get("name") or f"Camera {i}"),
-                "ip": str(cam["ip"]),
-                "port": int(cam.get("port", DEFAULT_PORT)),
-                "username": str(cam.get("username", "admin")),
-                "password": str(cam.get("password", "")),
-                "channel": int(cam.get("channel", 1)),
-                "stream": stream,
-            }
-        )
-    return {"rows": rows, "cols": cols, "cameras": checked}
-
-
-def write_example(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(EXAMPLE_CONFIG, indent=2) + "\n")
-    path.chmod(0o600)  # it will hold camera passwords
-
-
-# ── RTSP ──────────────────────────────────────────────────────────────
-def build_rtsp_url(cam: dict) -> str:
-    """Dahua's RTSP address for a camera; subtype 0 is the main stream, 1 the sub stream."""
-    subtype = 0 if cam["stream"] == "main" else 1
-    credentials = f"{quote(cam['username'], safe='')}:{quote(cam['password'], safe='')}@"
-    return (
-        f"rtsp://{credentials}{cam['ip']}:{cam['port']}"
-        f"/cam/realmonitor?channel={cam['channel']}&subtype={subtype}&unicast=true&proto=Onvif"
-    )
-
-
-def redact(url: str) -> str:
-    """The address without its password, for logs."""
-    return re.sub(r"(rtsp://[^:/@]*):[^@]*@", r"\1:***@", url)
-
-
-class FrameReader(QThread):
-    """Reads frames from one RTSP stream in the background and reconnects when it drops."""
-
-    frame_ready = pyqtSignal(QImage)
-    status_changed = pyqtSignal(str, QColor)
-
-    def __init__(self, camera_name: str, rtsp_url: str):
-        super().__init__()
-        self.camera_name = camera_name
-        self.rtsp_url = rtsp_url
-        self._running = True
-
-    def stop(self) -> None:
-        """Ask the thread to finish (call wait() to wait for it)."""
-        self._running = False
-
-    def _status(self, text: str, color: QColor) -> None:
-        self.status_changed.emit(text, color)
-
-    def _open(self):
-        cap = cv2.VideoCapture(self.rtsp_url)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if cap.isOpened():
-            return cap
-        cap.release()
-        return None
-
-    def run(self) -> None:
-        log.info("%s: connecting to %s", self.camera_name, redact(self.rtsp_url))
-        self._status("Connecting…", GREY)
-        failing_since = time.monotonic()
-        while self._running:
-            cap = self._open()
-            if cap is None:
-                failed = time.monotonic() - failing_since >= ERROR_AFTER
-                self._status("Error — check the camera" if failed else "Reconnecting…", RED if failed else ORANGE)
-                self._sleep(RECONNECT_DELAY)
-                continue
-            self._status("Connected", GREEN)
-            while self._running:
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    break
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb.shape
-                self.frame_ready.emit(QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy())
-            cap.release()
-            if self._running:
-                log.info("%s: stream ended, reconnecting", self.camera_name)
-                failing_since = time.monotonic()
-                self._status("Reconnecting…", ORANGE)
-                self._sleep(RECONNECT_DELAY)
-        log.info("%s: stopped", self.camera_name)
-
-    def _sleep(self, seconds: float) -> None:
-        end = time.monotonic() + seconds
-        while self._running and time.monotonic() < end:
-            time.sleep(0.1)
 
 
 # ── Widgets ───────────────────────────────────────────────────────────
 class CameraPanel(QFrame):
     """One camera: its video, scaled into the cell, and a status line."""
 
-    def __init__(self, name: str, rtsp_url: str | None, parent=None):
+    def __init__(self, name: str, rtsp_url: str | None, parent=None, **reader_options):
         super().__init__(parent)
         self.name = name
-        self.status = "No camera" if rtsp_url is None else "Connecting…"
-        self._frame: QImage | None = None
+        self.reader = CameraReader(name, rtsp_url, **reader_options) if rtsp_url else None
+        self._frame_id = 0
+        self._shown_status: tuple[str, str] | None = None
 
         self.video = QLabel("—" if rtsp_url is None else "")
         self.video.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video.setStyleSheet("QLabel { background-color: #000; color: #888; }")
-        # A label's natural minimum is the size of its picture, so every frame scaled to the label
+        # A label's natural minimum is the size of its picture, so every frame sized to the label
         # would hold the window at that size or push it bigger. Ignoring it lets the grid decide.
         self.video.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.video.setMinimumSize(1, 1)
 
-        self.status_label = QLabel(f"{name} — {self.status}")
+        self.status_label = QLabel()
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setFont(QFont("Monospace", 9))
         self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -231,46 +90,55 @@ class CameraPanel(QFrame):
         layout.setSpacing(4)
         layout.addWidget(self.video, 1)
         layout.addWidget(self.status_label)
-        self._set_border(GREY)
+        self._show_status(("Connecting…", "grey") if self.reader else ("No camera", "grey"))
 
-        self.reader = FrameReader(name, rtsp_url) if rtsp_url else None
-        if self.reader:
-            self.reader.frame_ready.connect(self._on_frame)
-            self.reader.status_changed.connect(self._on_status)
-
-    def _set_border(self, color: QColor) -> None:
-        self.setStyleSheet(f"CameraPanel {{ border: 2px solid {color.name()}; border-radius: 6px; }}")
-
-    def _show(self) -> None:
-        if self._frame is None:
-            return
-        size = self.video.size()
-        if size.width() < 2 or size.height() < 2:
-            return
-        pixmap = QPixmap.fromImage(self._frame)
-        self.video.setPixmap(
-            pixmap.scaled(size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        )
-
-    def _on_frame(self, image: QImage) -> None:
-        self._frame = image
-        self._show()
-
-    def _on_status(self, text: str, color: QColor) -> None:
-        self.status = text
-        self.status_label.setText(f"{self.name} — {text}")
-        self._set_border(color)
-        window = self.window()
-        if isinstance(window, CameraWall):
-            window.update_overall_status()
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._show()  # rescale the last frame right away, not at the next one
+    @property
+    def connected(self) -> bool:
+        return self._shown_status is not None and self._shown_status[1] == "green"
 
     def start(self) -> None:
         if self.reader:
+            self.reader.set_output_size(*self._video_pixels())
             self.reader.start()
+
+    def refresh(self) -> bool:
+        """Show the reader's newest status and frame, if they changed. True if the status did."""
+        if not self.reader:
+            return False
+        status = self.reader.status
+        status_changed = status != self._shown_status
+        if status_changed:
+            self._show_status(status)
+
+        frame_id, frame = self.reader.latest_frame()
+        if frame is not None and frame_id != self._frame_id:
+            self._frame_id = frame_id
+            # The reader already scaled the frame to fit the cell: show it as it is
+            frame = np.ascontiguousarray(frame)
+            height, width = frame.shape[:2]
+            image = QImage(frame.data, width, height, 3 * width, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(image)  # copies the pixels
+            pixmap.setDevicePixelRatio(self.video.devicePixelRatioF())
+            self.video.setPixmap(pixmap)
+        return status_changed
+
+    def _show_status(self, status: tuple[str, str]) -> None:
+        text, color = status
+        self._shown_status = status
+        self.status_label.setText(f"{self.name} — {text}")
+        self.setStyleSheet(
+            f"CameraPanel {{ border: 2px solid {COLORS.get(color, COLORS['grey']).name()}; border-radius: 6px; }}"
+        )
+
+    def _video_pixels(self) -> tuple[float, float]:
+        """The video area's size in physical pixels (sharp pictures on HiDPI screens too)."""
+        ratio = self.video.devicePixelRatioF()
+        return self.video.width() * ratio, self.video.height() * ratio
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.reader:  # the next frames come at the new size
+            self.reader.set_output_size(*self._video_pixels())
 
 
 class CameraWall(QMainWindow):
@@ -295,11 +163,21 @@ class CameraWall(QMainWindow):
         cameras = config["cameras"]
         if len(cameras) > rows * cols:
             log.warning("%d cameras but a %dx%d grid: showing the first %d", len(cameras), rows, cols, rows * cols)
+        shown = cameras[: rows * cols]
+
+        # Hardware decoding for every camera unless the config limits it ("hardware_decoders")
+        slots = config.get("hardware_decoders")
+        hardware = plan_decoders(shown, hardware_decoder_limit() if slots is None else slots)
+        threads = software_threads(hardware.count(False), os.cpu_count() or 1)
+
         self.panels: list[CameraPanel] = []
         for index in range(rows * cols):
-            if index < len(cameras):
-                cam = cameras[index]
-                panel = CameraPanel(cam["name"], build_rtsp_url(cam), self)
+            if index < len(shown):
+                cam = shown[index]
+                panel = CameraPanel(
+                    cam["name"], build_rtsp_url(cam), self,
+                    hardware=hardware[index], threads=threads, aspect=cam["aspect_ratio"],
+                )
             else:
                 panel = CameraPanel(f"Cell {index + 1}", None, self)
             grid.addWidget(panel, index // cols, index % cols)
@@ -309,6 +187,9 @@ class CameraWall(QMainWindow):
         for c in range(cols):
             grid.setColumnStretch(c, 1)
         self.update_overall_status()
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self._refresh)
 
     def fit_to_screen(self) -> None:
         """Open at WINDOW_FRACTION of the available screen, centered."""
@@ -324,21 +205,28 @@ class CameraWall(QMainWindow):
     def start(self) -> None:
         for panel in self.panels:
             panel.start()
+        self._refresh_timer.start(REFRESH_MS)
+
+    def _refresh(self) -> None:
+        if any([panel.refresh() for panel in self.panels]):  # every panel, not just up to the first change
+            self.update_overall_status()
 
     def update_overall_status(self) -> None:
         cameras = [p for p in self.panels if p.reader]
-        connected = sum(1 for p in cameras if p.status == "Connected")
+        connected = sum(1 for p in cameras if p.connected)
         self.overall.setText(f"Connected: {connected}/{len(cameras)}")
         color = "green" if cameras and connected == len(cameras) else ("orange" if connected else "red")
         self.overall.setStyleSheet(f"color: {color};")
 
     def closeEvent(self, event) -> None:
         log.info("Shutting down…")
+        self._refresh_timer.stop()
         readers = [p.reader for p in self.panels if p.reader]
         for reader in readers:
-            reader.stop()  # ask them all first, then wait: closing takes seconds, not 3 s per camera
+            reader.stop()  # ask them all first, then wait: closing takes seconds, not seconds per camera
+        deadline = time.monotonic() + STOP_WAIT
         for reader in readers:
-            reader.wait(5000)
+            reader.join(max(0.0, deadline - time.monotonic()))  # daemon threads: a stuck one won't block exit
         event.accept()
 
 
@@ -352,11 +240,9 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
-    path = config_path(args.config)
+    path = get_config_path(args.config)
     try:
-        config = load_config(path)
-        if args.grid:
-            config["rows"], config["cols"] = parse_grid(args.grid)
+        config = load_config(path, grid_override=args.grid)
     except FileNotFoundError:
         write_example(path)
         message = (

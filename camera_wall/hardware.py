@@ -1,8 +1,10 @@
-"""How many cameras the device can decode in hardware at once (Android MediaCodec).
+"""Which cameras get a hardware decoder.
 
 TV processors are slow at decoding video in software, H.265 above all, but the video hardware
-next to them is fast. It only runs a few streams at once, though (2 on many TVs), so the wall
-gives those to the heaviest cameras and decodes the rest in software.
+next to them is fast. It only runs a few streams at once, though, so on Android the wall gives
+those to the heaviest cameras and decodes the rest in software. Desktop GPUs (NVIDIA, Intel)
+have no such small limit: every camera tries hardware decoding, and one whose decoder doesn't
+work carries on in software by itself (see camera_reader).
 """
 
 from __future__ import annotations
@@ -20,11 +22,12 @@ SOFTWARE_PREFIXES = ("omx.google.", "c2.android.", "c2.google.")
 
 
 @lru_cache(maxsize=1)
-def hardware_decoder_limit() -> int:
-    """The number of video streams the device's hardware decoder handles at once; 0 when there
-    is none, it can't be found out, or this isn't Android."""
+def hardware_decoder_limit() -> int | None:
+    """How many video streams the device's hardware decodes at once: on Android the number
+    MediaCodec reports (0 when there's no hardware decoder or it can't be found out); None
+    elsewhere, meaning no known limit."""
     if not is_android():
-        return 0
+        return None
     try:
         return _query_media_codecs()
     except Exception as exc:  # noqa: BLE001 - jnius/Java errors: just don't use hardware
@@ -52,9 +55,11 @@ def _query_media_codecs() -> int:
     return 0
 
 
-def plan_decoders(cameras: list[dict], hardware_slots: int) -> list[bool]:
+def plan_decoders(cameras: list[dict], hardware_slots: int | None) -> list[bool]:
     """Which cameras get a hardware decoder: the main streams first (they're the heaviest),
-    then the others in order, up to ``hardware_slots``."""
+    then the others in order, up to ``hardware_slots`` (None: all of them)."""
+    if hardware_slots is None:
+        return [True] * len(cameras)
     order = sorted(range(len(cameras)), key=lambda i: (cameras[i]["stream"] != "main", i))
     chosen = set(order[: max(0, hardware_slots)])
     return [i in chosen for i in range(len(cameras))]
