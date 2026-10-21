@@ -25,7 +25,7 @@ import sys
 import time
 
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -65,6 +65,8 @@ COLORS = {
 class CameraPanel(QFrame):
     """One camera: its video, scaled into the cell, and a status line."""
 
+    double_clicked = pyqtSignal()  # the wall shows only this camera, or the whole grid again
+
     def __init__(self, name: str, rtsp_url: str | None, parent=None, **reader_options):
         super().__init__(parent)
         self.name = name
@@ -100,6 +102,11 @@ class CameraPanel(QFrame):
         if self.reader:
             self.reader.set_output_size(*self._video_pixels())
             self.reader.start()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        # A double-click on the video arrives here too: the label doesn't handle mouse clicks itself
+        self.double_clicked.emit()
+        event.accept()
 
     def refresh(self) -> bool:
         """Show the reader's newest status and frame, if they changed. True if the status did."""
@@ -156,10 +163,12 @@ class CameraWall(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        grid = QGridLayout(central)
+        self.grid = grid = QGridLayout(central)
         grid.setContentsMargins(8, 8, 8, 8)
         grid.setSpacing(8)
         rows, cols = config["rows"], config["cols"]
+        self.rows, self.cols = rows, cols
+        self.focused: CameraPanel | None = None  # the camera that fills the window, if one does
         cameras = config["cameras"]
         if len(cameras) > rows * cols:
             log.warning("%d cameras but a %dx%d grid: showing the first %d", len(cameras), rows, cols, rows * cols)
@@ -182,6 +191,7 @@ class CameraWall(QMainWindow):
                 panel = CameraPanel(f"Cell {index + 1}", None, self)
             grid.addWidget(panel, index // cols, index % cols)
             self.panels.append(panel)
+            panel.double_clicked.connect(lambda panel=panel: self.toggle_focus(panel))
         for r in range(rows):
             grid.setRowStretch(r, 1)
         for c in range(cols):
@@ -206,6 +216,23 @@ class CameraWall(QMainWindow):
         for panel in self.panels:
             panel.start()
         self._refresh_timer.start(REFRESH_MS)
+
+    def toggle_focus(self, panel: CameraPanel) -> None:
+        """Double-click a camera to fill the window with it; double-click it again for the whole grid.
+
+        The other cameras are only hidden, and their rows and columns stop taking space, so the camera stays
+        where it is in the grid and keeps streaming: its reader gets the bigger size from resizeEvent.
+        """
+        if self.focused is None and panel.reader is None:
+            return  # an empty cell: nothing to look at
+        self.focused = panel if self.focused is None else None
+        row, col = divmod(self.panels.index(panel), self.cols)
+        for r in range(self.rows):
+            self.grid.setRowStretch(r, 1 if self.focused is None or r == row else 0)
+        for c in range(self.cols):
+            self.grid.setColumnStretch(c, 1 if self.focused is None or c == col else 0)
+        for other in self.panels:
+            other.setVisible(self.focused is None or other is panel)
 
     def _refresh(self) -> None:
         if any([panel.refresh() for panel in self.panels]):  # every panel, not just up to the first change
